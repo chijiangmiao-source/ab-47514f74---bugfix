@@ -9,9 +9,17 @@ unfinished export, consult the journal/artifact records plus on-disk digests:
   atomic link and the DB update) -> converge the bookkeeping;
 * anything else (partial write, digest mismatch, missing file, orphans) ->
   clean up the残缺 artifacts and requeue the export.
+
+Additionally, worker startup runs a self-heal sweep over PUBLISHED exports:
+a published export is only healthy when its recorded digest equals the
+deterministic render of its own frozen decision and its own published file
+holds those bytes. Legacy rows that referenced another export's artifact are
+converged in place to their own verifiable artifact; the stage never leaves
+PUBLISHED.
 """
 import hashlib
 import os
+import uuid
 
 from . import artifacts, store
 from .render import render_artifact_bytes
@@ -66,6 +74,60 @@ def recover_export(conn, export_id, actor):
         store.journal(conn, export_id, actor, "recovery_cleanup", "removed=%d" % len(removed))
         store.requeue(conn, export_id, actor, "recovery_cleanup removed=%d" % len(removed))
     return "requeued"
+
+
+def _is_self_consistent(export_row):
+    """A PUBLISHED export is healthy only when its recorded artifact is its
+    own: recorded digest == deterministic render of its own frozen decision,
+    stored under its own published path, with matching bytes on disk."""
+    export_id = export_row["export_id"]
+    _, expected_digest = _expected(export_row)
+    path = export_row["artifact_path"]
+    return (
+        export_row["artifact_digest"] == expected_digest
+        and path == artifacts.published_path(export_id)
+        and os.path.exists(path)
+        and artifacts.sha256_file(path) == expected_digest
+    )
+
+
+def _repair_one(conn, export_row, actor):
+    """Converge one PUBLISHED export onto its own artifact, in place.
+
+    Safe to run concurrently: the rendered bytes are deterministic, publish is
+    atomic and non-clobbering, and the DB update writes the same values.
+    """
+    export_id = export_row["export_id"]
+    data, digest = _expected(export_row)
+    pub = artifacts.published_path(export_id)
+    tmp = artifacts.tmp_path(export_id, "repair-" + uuid.uuid4().hex[:8])
+    artifacts.write_tmp(tmp, data)
+    if artifacts.sha256_file(tmp) != digest:  # pragma: no cover - defensive
+        artifacts.quarantine(tmp)
+        with store.immediate(conn):
+            store.journal(conn, export_id, actor, "publish_repair_failed", "staged digest mismatch")
+        return False
+    if os.path.exists(pub) and artifacts.sha256_file(pub) != digest:
+        target = artifacts.quarantine(pub)
+        with store.immediate(conn):
+            store.journal(conn, export_id, actor, "publish_repair_quarantined", target)
+    artifacts.publish(tmp, pub, digest)
+    with store.immediate(conn):
+        return store.converge_published_artifact(conn, export_id, digest, pub, actor)
+
+
+def repair_published_exports(conn, actor):
+    """Self-heal PUBLISHED exports whose recorded artifact is not their own.
+
+    Returns the list of repaired export_ids. Healthy rows are left untouched.
+    """
+    repaired = []
+    for row in store.list_exports(conn, limit=1000):
+        if row["stage"] != "PUBLISHED" or _is_self_consistent(row):
+            continue
+        if _repair_one(conn, row, actor):
+            repaired.append(row["export_id"])
+    return repaired
 
 
 def sweep_orphans(conn, actor, older_than_seconds=30.0):

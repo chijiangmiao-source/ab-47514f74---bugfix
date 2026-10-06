@@ -7,6 +7,12 @@ the live HTTP API through the required scenarios:
   2. crash recovery (converge a complete staged artifact; clean up a partial one)
   3. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
+  4. two business-equivalent submissions under different export ids publish
+     independent artifacts, each carrying its own frozen identity
+
+VERIFY_MODE=recheck skips the build/unit phases and re-verifies, from a state
+file written by the full run, that every export is still PUBLISHED with its
+own digest and download content after the services were restarted.
 
 Exits 0 when everything passes, 1 otherwise.
 """
@@ -22,6 +28,8 @@ import uuid
 
 API = os.environ.get("API_BASE", "http://localhost:8080").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
+STATE_DIR = os.environ.get("VERIFY_STATE_DIR", "./verify-state")
+MODE = os.environ.get("VERIFY_MODE", "full")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN = uuid.uuid4().hex[:6]
 
@@ -93,6 +101,24 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def state_path():
+    return os.path.join(STATE_DIR, "run.json")
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(state_path(), "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+
+
+def load_state():
+    try:
+        with open(state_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -136,7 +162,7 @@ def wait_for_api():
 
 
 def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    e1, e2, e3, e4, e5, e6, e7 = ("VFY%d-%s" % (i, RUN) for i in range(1, 8))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -306,19 +332,139 @@ def smoke():
           detail2b is not None and detail2b["artifact_digest"] == detail2["artifact_digest"])
     check("exactly one published artifact file for E2", len(published_files(e2)) == 1)
 
+    step("两份不同标识的等价提交：各自独立发布、各自可复核")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201, "HTTP %s %s" % (status, raw[:300]))
+    receipt6 = as_json(raw)
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e7, "records": reordered})
+    check("submit E7 (business-equivalent) -> 201", status == 201, "HTTP %s %s" % (status, raw[:300]))
+    receipt7 = as_json(raw)
+    check("equivalent submissions get distinct first receipts",
+          receipt6.get("receipt_id") != receipt7.get("receipt_id"))
+    detail6 = wait_for_stage(e6, "PUBLISHED", 90)
+    detail7 = wait_for_stage(e7, "PUBLISHED", 90)
+    check("E6 published", detail6 is not None and detail6["stage"] == "PUBLISHED",
+          "last=%s" % (detail6 and detail6.get("stage")))
+    check("E7 published", detail7 is not None and detail7["stage"] == "PUBLISHED",
+          "last=%s" % (detail7 and detail7.get("stage")))
+    if detail6 and detail7 and detail6["stage"] == detail7["stage"] == "PUBLISHED":
+        a6, a7 = detail6["artifact_digest"], detail7["artifact_digest"]
+        check("artifact digests are independent", bool(a6) and bool(a7) and a6 != a7,
+              "%s vs %s" % (a6, a7))
+        code6, body6, _ = download(e6)
+        code7, body7, _ = download(e7)
+        check("download E6 -> 200", code6 == 200, "HTTP %s" % code6)
+        check("download E7 -> 200", code7 == 200, "HTTP %s" % code7)
+        if code6 == 200:
+            doc6 = as_json(body6)
+            check("E6 download carries its own frozen identity",
+                  doc6.get("export_id") == e6
+                  and doc6.get("received_at") == receipt6["received_at"]
+                  and doc6.get("input_digest") == receipt6["input_digest"])
+            check("E6 artifact digest matches its download",
+                  hashlib.sha256(body6).hexdigest() == a6)
+        if code7 == 200:
+            doc7 = as_json(body7)
+            check("E7 download carries its own frozen identity",
+                  doc7.get("export_id") == e7
+                  and doc7.get("received_at") == receipt7["received_at"]
+                  and doc7.get("input_digest") == receipt7["input_digest"])
+            check("E7 artifact digest matches its download",
+                  hashlib.sha256(body7).hexdigest() == a7)
+        if code6 == code7 == 200:
+            check("masked business content is equivalent",
+                  as_json(body6)["records"] == as_json(body7)["records"])
+            check("download bytes differ (no shared artifact)", body6 != body7)
+            file6 = os.path.join(DATA_DIR, "artifacts", "published", e6 + ".json")
+            file7 = os.path.join(DATA_DIR, "artifacts", "published", e7 + ".json")
+            disk6 = open(file6, "rb").read() if os.path.exists(file6) else None
+            disk7 = open(file7, "rb").read() if os.path.exists(file7) else None
+            check("published files are independent and match their downloads",
+                  disk6 == body6 and disk7 == body7)
+        check("exactly one published artifact file for E6", len(published_files(e6)) == 1)
+        check("exactly one published artifact file for E7", len(published_files(e7)) == 1)
+
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
+    for eid in (e1, e2, e3, e4, e5, e6, e7):
         leftovers.extend(tmp_files(eid))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 
+    step("记录运行状态，供服务重启后复核")
+    state = {"run": RUN, "equivalence_pair": [e6, e7], "exports": {}}
+    for eid in (e1, e2, e3, e4, e5, e6, e7):
+        status, raw, _ = req("GET", "/api/exports/" + eid)
+        if status == 200:
+            detail = as_json(raw)
+            state["exports"][eid] = {
+                "stage": detail["stage"],
+                "artifact_digest": detail["artifact_digest"],
+                "receipt_id": detail["receipt_id"],
+                "received_at": detail["received_at"],
+                "input_digest": detail["input_digest"],
+                "rules_digest": detail["rules_digest"],
+            }
+    check("all exports PUBLISHED before restart",
+          len(state["exports"]) == 7
+          and all(e["stage"] == "PUBLISHED" for e in state["exports"].values()),
+          json.dumps({k: v["stage"] for k, v in state["exports"].items()}))
+    save_state(state)
+    check("state file written for post-restart recheck", load_state() is not None)
+
+
+def recheck():
+    """Post-restart persistence check: every export recorded by the full run
+    must still be PUBLISHED with its own digest, and its download must still
+    carry its own frozen identity."""
+    step("重启后复核：已发布状态与工件保持各自独立、可校验")
+    state = load_state()
+    check("state file from full run is available", state is not None,
+          "expected at %s" % state_path())
+    if not state:
+        return
+    downloads = {}
+    for export_id, expected in sorted(state["exports"].items()):
+        status, raw, _ = req("GET", "/api/exports/" + export_id)
+        detail = as_json(raw) if status == 200 else {}
+        check("%s still PUBLISHED after restart" % export_id,
+              status == 200 and detail.get("stage") == "PUBLISHED",
+              "HTTP %s stage=%s" % (status, detail.get("stage")))
+        check("%s artifact digest unchanged after restart" % export_id,
+              detail.get("artifact_digest") == expected["artifact_digest"],
+              "%s vs %s" % (detail.get("artifact_digest"), expected["artifact_digest"]))
+        code, body, _ = download(export_id)
+        check("%s download still 200 after restart" % export_id, code == 200, "HTTP %s" % code)
+        if code == 200:
+            doc = as_json(body)
+            check("%s download matches its own frozen record" % export_id,
+                  hashlib.sha256(body).hexdigest() == expected["artifact_digest"]
+                  and doc.get("export_id") == export_id
+                  and doc.get("received_at") == expected["received_at"]
+                  and doc.get("input_digest") == expected["input_digest"]
+                  and doc.get("rules_digest") == expected["rules_digest"])
+            downloads[export_id] = body
+        check("%s has exactly one published file" % export_id,
+              len(published_files(export_id)) == 1, str(published_files(export_id)))
+    pair = [eid for eid in state.get("equivalence_pair", []) if eid in downloads]
+    if len(pair) == 2:
+        check("equivalence pair still serves independent artifacts",
+              downloads[pair[0]] != downloads[pair[1]])
+        check("equivalence pair digests still distinct",
+              state["exports"][pair[0]]["artifact_digest"]
+              != state["exports"][pair[1]]["artifact_digest"])
+
 
 def main():
-    print("verify: one-shot acceptance run %s against %s" % (RUN, API), flush=True)
-    build_checks()
-    unit_tests()
-    wait_for_api()
-    smoke()
+    if MODE == "recheck":
+        print("verify: post-restart recheck against %s" % API, flush=True)
+        wait_for_api()
+        recheck()
+    else:
+        print("verify: one-shot acceptance run %s against %s" % (RUN, API), flush=True)
+        build_checks()
+        unit_tests()
+        wait_for_api()
+        smoke()
     print("\n==============================================")
     if FAILURES:
         print("verify: FAILED (%d): %s" % (len(FAILURES), ", ".join(FAILURES)), flush=True)

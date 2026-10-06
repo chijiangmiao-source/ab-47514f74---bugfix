@@ -44,9 +44,12 @@ services:
     environment:
       API_BASE: "http://app:8080"
       DATA_DIR: /data
+      VERIFY_STATE_DIR: /state
     volumes:
       - data:/data:ro
+      - verify-state:/state     # full run records expectations; recheck re-reads them after restart
     restart: "no"              # one-shot: runs the acceptance suite and exits
 
 volumes:
   data:
+  verify-state:

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -74,6 +75,31 @@ class ProcessTest(WorkerTestBase):
         self.assertEqual(1, len(artifacts.list_published_files()))
         expected = hashlib.sha256(render_artifact_bytes(row)).hexdigest()
         self.assertEqual(expected, row["artifact_digest"])
+
+    def test_equivalent_exports_publish_independent_artifacts(self):
+        """Same business content under two export ids: each publishes its own
+        artifact (own export_id + frozen receipt), never a shared file."""
+        recs = [{"ts": "t0", "lat": 31.2, "depth_m": 10}]
+        store.submit_export(self.conn, "E-1", recs)
+        store.submit_export(self.conn, "E-2", [dict(reversed(list(recs[0].items())))])
+        for export_id in ("E-1", "E-2"):
+            fencing = store.acquire_lease(self.conn, worker.lease_resource(export_id), "w-test", 5)
+            self.assertEqual("published", worker.process_export(self.conn, export_id, "w-test", fencing))
+
+        row1 = store.get_export(self.conn, "E-1")
+        row2 = store.get_export(self.conn, "E-2")
+        self.assertNotEqual(row1["artifact_digest"], row2["artifact_digest"])
+        self.assertNotEqual(row1["artifact_path"], row2["artifact_path"])
+        self.assertEqual(2, len(artifacts.list_published_files()))
+        for export_id, row in (("E-1", row1), ("E-2", row2)):
+            data = artifacts.load_verified(row)
+            self.assertEqual(hashlib.sha256(data).hexdigest(), row["artifact_digest"])
+            doc = json.loads(data)
+            self.assertEqual(export_id, doc["export_id"])
+            self.assertEqual(row["received_at"], doc["received_at"])
+        # same masking rules + same business records -> same masked payload
+        self.assertEqual(json.loads(artifacts.load_verified(row1))["records"],
+                         json.loads(artifacts.load_verified(row2))["records"])
 
     def test_tick_recovers_crashed_export_after_lease_expiry(self):
         """Simulate a crashed worker: staged artifact + expired lease -> tick converges."""

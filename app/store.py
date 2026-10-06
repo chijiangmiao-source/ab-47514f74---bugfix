@@ -357,16 +357,37 @@ def published_artifacts(conn, export_id):
     return [dict(row) for row in rows]
 
 
-def published_for_decision(conn, decision_hash, exclude_export_id):
-    row = conn.execute(
-        """SELECT export_id, artifact_digest, artifact_path
-           FROM exports
-           WHERE decision_hash = ? AND export_id != ? AND stage = 'PUBLISHED'
-           ORDER BY published_at, export_id
-           LIMIT 1""",
-        (decision_hash, exclude_export_id),
-    ).fetchone()
-    return dict(row) if row else None
+def converge_published_artifact(conn, export_id, digest, path, actor):
+    """Repair an already-PUBLISHED export's artifact pointer in place.
+
+    Used to converge legacy rows that referenced another export's artifact:
+    the stage stays PUBLISHED (terminal, never regresses); only the artifact
+    digest/path are replaced with this export's own, and the artifacts-table
+    published row is converged to match. Returns False when the export is not
+    PUBLISHED (nothing repaired).
+    """
+    cur = conn.execute(
+        """UPDATE exports SET artifact_digest = ?, artifact_path = ?, updated_at = ?
+           WHERE export_id = ? AND stage = 'PUBLISHED'""",
+        (digest, path, utcnow(), export_id),
+    )
+    if cur.rowcount != 1:
+        journal(conn, export_id, actor, "publish_repair_skipped", "stage is not PUBLISHED")
+        return False
+    cur = conn.execute(
+        """UPDATE artifacts SET path = ?, digest = ?, created_at = ?
+           WHERE export_id = ? AND kind = 'published'""",
+        (path, digest, utcnow(), export_id),
+    )
+    if cur.rowcount == 0:
+        conn.execute(
+            """INSERT INTO artifacts(export_id, kind, path, digest, created_at)
+               VALUES (?,'published',?,?,?)
+               ON CONFLICT(export_id) WHERE kind = 'published' DO NOTHING""",
+            (export_id, path, digest, utcnow()),
+        )
+    journal(conn, export_id, actor, "publish_repaired", "digest=%s path=%s" % (digest, path))
+    return True
 
 
 def abort_artifact(conn, artifact_id):

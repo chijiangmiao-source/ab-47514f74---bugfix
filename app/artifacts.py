@@ -9,6 +9,7 @@ import os
 import time
 
 from . import config
+from .render import render_artifact_bytes
 
 
 class PublishedMismatch(Exception):
@@ -125,15 +126,21 @@ def list_published_files():
 
 
 def load_verified(export_row):
-    """Read a published artifact only when its digest matches the frozen record.
+    """Read a published artifact only when it is this export's own artifact.
 
-    The download path must never expose unverified content.
+    The served bytes must be the deterministic render of this export's own
+    frozen decision: the recorded digest, the recomputed digest and the file
+    digest must all agree. Anything else is refused, so the download path can
+    never expose another export's content.
     """
+    expected = sha256_bytes(render_artifact_bytes(export_row))
+    if export_row.get("artifact_digest") != expected:
+        raise DigestMismatch("recorded digest is not this export's own artifact")
     path = export_row.get("artifact_path")
     if not path or not os.path.exists(path):
         raise ArtifactMissing("artifact file is missing")
     with open(path, "rb") as fh:
         data = fh.read()
-    if sha256_bytes(data) != export_row.get("artifact_digest"):
+    if sha256_bytes(data) != expected:
         raise DigestMismatch("artifact digest mismatch")
     return data

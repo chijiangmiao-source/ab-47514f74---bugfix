@@ -37,18 +37,11 @@ def process_export(conn, export_id, me, fencing):
             return "skipped"
         store.journal(conn, export_id, me, "processing_started", None)
 
+    # Every export publishes its own artifact, rendered from its own frozen
+    # decision. Business-equivalent exports under a different export_id must
+    # never share an artifact: the bytes embed the export_id and the frozen
+    # receipt timestamp, so reuse would serve another export's identity.
     export = store.get_export(conn, export_id)
-    previous = store.published_for_decision(conn, export["decision_hash"], export_id)
-    if previous:
-        with store.immediate(conn):
-            store.record_artifact(
-                conn, export_id, "published", previous["artifact_path"], previous["artifact_digest"]
-            )
-            store.mark_published(
-                conn, export_id, previous["artifact_digest"], previous["artifact_path"], me,
-                "matching_decision_reuse",
-            )
-        return "published"
     data = render_artifact_bytes(export)
     digest = hashlib.sha256(data).hexdigest()
     tmp = artifacts.tmp_path(export_id, uuid.uuid4().hex[:8])
@@ -127,6 +120,9 @@ def run_forever(me=None):
     conn = store.connect()
     store.init_db(conn)
     recovery.sweep_orphans(conn, me)
+    repaired = recovery.repair_published_exports(conn, me)
+    if repaired:
+        print("[%s] repaired %d published export(s): %s" % (me, len(repaired), ",".join(repaired)), flush=True)
     print("[%s] worker started (poll=%.2fs lease_ttl=%.1fs)" % (me, config.poll_interval(), config.lease_ttl()), flush=True)
     while True:
         try:
