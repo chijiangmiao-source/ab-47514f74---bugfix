@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -74,6 +75,36 @@ class ProcessTest(WorkerTestBase):
         self.assertEqual(1, len(artifacts.list_published_files()))
         expected = hashlib.sha256(render_artifact_bytes(row)).hexdigest()
         self.assertEqual(expected, row["artifact_digest"])
+
+    def test_distinct_export_ids_equivalent_content_get_independent_artifacts(self):
+        """Different export ids, business-identical records + same frozen rules:
+        each export renders, freezes and publishes its OWN artifact."""
+        records = [{"ts": "t0", "lat": 31.2, "depth_m": 10, "vessel_id": "V-1"}]
+        _, receipt_a = store.submit_export(self.conn, "E-A", records)
+        self.process_published("E-A")
+        _, receipt_b = store.submit_export(self.conn, "E-B", records)  # unchanged rules
+        self.process_published("E-B")
+
+        row_a = store.get_export(self.conn, "E-A")
+        row_b = store.get_export(self.conn, "E-B")
+        self.assertEqual("PUBLISHED", row_a["stage"])
+        self.assertEqual("PUBLISHED", row_b["stage"])
+        # independent receipts, freeze times, files and digests
+        self.assertNotEqual(receipt_a["receipt_id"], receipt_b["receipt_id"])
+        self.assertNotEqual(receipt_a["received_at"], receipt_b["received_at"])
+        self.assertNotEqual(row_a["artifact_digest"], row_b["artifact_digest"])
+        self.assertTrue(row_a["artifact_path"].endswith("E-A.json"))
+        self.assertTrue(row_b["artifact_path"].endswith("E-B.json"))
+        self.assertEqual(2, len(artifacts.list_published_files()))
+        for row, export_id in ((row_a, "E-A"), (row_b, "E-B")):
+            doc = json.loads(artifacts.load_verified(row))
+            self.assertEqual(export_id, doc["export_id"])
+            self.assertEqual(row["received_at"], doc["received_at"])
+            self.assertEqual(1, len(store.published_artifacts(self.conn, export_id)))
+
+    def process_published(self, export_id):
+        fencing = store.acquire_lease(self.conn, worker.lease_resource(export_id), "w-test", 5)
+        self.assertEqual("published", worker.process_export(self.conn, export_id, "w-test", fencing))
 
     def test_tick_recovers_crashed_export_after_lease_expiry(self):
         """Simulate a crashed worker: staged artifact + expired lease -> tick converges."""

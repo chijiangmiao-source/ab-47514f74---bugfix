@@ -17,7 +17,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import artifacts, config, masking, store
+from . import artifacts, config, masking, recovery, store
 
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
@@ -209,13 +209,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             data = artifacts.load_verified(row)
-        except artifacts.ArtifactMissing:
-            self._send_error_json(410, "artifact_missing", "published artifact file is gone")
-            return
-        except artifacts.DigestMismatch:
-            self._send_error_json(500, "artifact_unverified",
-                                  "artifact failed digest verification; refusing to serve")
-            return
+        except (artifacts.ArtifactMissing, artifacts.DigestMismatch,
+                artifacts.IdentityMismatch):
+            # Never serve unverified or another export id's bytes. Run one
+            # convergence pass: legacy aliases are repointed to their own
+            # artifact and a missing/corrupt own file is regenerated from the
+            # frozen record (deterministic -> identical digest), then retry.
+            repair_conn = store.connect()
+            try:
+                recovery.converge_legacy_aliases(repair_conn, "api-download")
+                row = store.get_export(repair_conn, export_id)
+            finally:
+                repair_conn.close()
+            try:
+                data = artifacts.load_verified(row)
+            except artifacts.ArtifactMissing as exc:
+                self._send_error_json(410, "artifact_missing", str(exc))
+                return
+            except (artifacts.DigestMismatch, artifacts.IdentityMismatch) as exc:
+                self._send_error_json(500, "artifact_unverified",
+                                      "refusing to serve a non-own artifact: %s" % exc)
+                return
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Disposition", 'attachment; filename="%s.json"' % export_id)
@@ -257,12 +271,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             export_id = doc.get("export_id")
             mode = doc.get("mode")
-            if not isinstance(export_id, str) or mode not in store.FAULT_MODES:
-                raise ApiError(422, "invalid_fault",
-                               "need export_id and mode in %s" % "/".join(store.FAULT_MODES))
+            target = doc.get("target_export_id")
+            if not isinstance(export_id, str):
+                raise ApiError(422, "invalid_fault", "need export_id")
             conn = store.connect()
             try:
-                store.set_fault(conn, export_id, mode)
+                if mode == store.LEGACY_ALIAS_MODE:
+                    if not isinstance(target, str) or not EXPORT_ID_RE.match(target):
+                        raise ApiError(422, "invalid_fault",
+                                       "legacy_alias needs a valid target_export_id")
+                    store.set_legacy_alias_fault(conn, export_id, target)
+                elif mode in store.FAULT_MODES:
+                    store.set_fault(conn, export_id, mode)
+                else:
+                    raise ApiError(422, "invalid_fault",
+                                   "need mode in %s/%s"
+                                   % ("/".join(store.FAULT_MODES), store.LEGACY_ALIAS_MODE))
             finally:
                 conn.close()
             self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
@@ -275,6 +299,10 @@ def main():
     conn = store.connect()
     try:
         store.init_db(conn)
+        repaired = recovery.converge_legacy_aliases(conn, "api-startup")
+        if repaired:
+            print("converged %d legacy aliased export(s): %s"
+                  % (len(repaired), ",".join(repaired)), flush=True)
     finally:
         conn.close()
     server = ThreadingHTTPServer(("0.0.0.0", config.port()), Handler)

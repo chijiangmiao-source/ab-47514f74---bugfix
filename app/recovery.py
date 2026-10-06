@@ -9,6 +9,13 @@ unfinished export, consult the journal/artifact records plus on-disk digests:
   atomic link and the DB update) -> converge the bookkeeping;
 * anything else (partial write, digest mismatch, missing file, orphans) ->
   clean up the残缺 artifacts and requeue the export.
+
+Legacy convergence: earlier versions reused the FIRST published export's file
+for a business-equivalent submission under a DIFFERENT export id. Those
+PUBLISHED rows alias another export's bytes. They are repaired in place (stage
+stays terminal) by materializing each export's own artifact from its frozen
+record and repointing the row, so the download API can never serve another
+identifier's content.
 """
 import hashlib
 import os
@@ -20,6 +27,42 @@ from .render import render_artifact_bytes
 def _expected(export_row):
     data = render_artifact_bytes(export_row)
     return data, hashlib.sha256(data).hexdigest()
+
+
+def _owns_verified_file(export_row):
+    """True iff the row points at its own canonical file that passes checks."""
+    own_path = os.path.abspath(artifacts.published_path(export_row["export_id"]))
+    path = export_row.get("artifact_path")
+    if not path or os.path.abspath(path) != own_path:
+        return False
+    try:
+        artifacts.load_verified(export_row)
+    except (artifacts.ArtifactMissing, artifacts.DigestMismatch, artifacts.IdentityMismatch):
+        return False
+    return True
+
+
+def converge_legacy_aliases(conn, actor):
+    """Repair PUBLISHED rows aliasing another export's artifact.
+
+    Each affected export is converged to its own independently verifiable file
+    rendered from its frozen record (records + rules snapshot + first receipt).
+    The PUBLISHED stage is never touched, so publication never regresses; the
+    stale artifact row is aborted as evidence. Idempotent and concurrency-safe:
+    a second pass finds the row already converged and makes no change.
+    """
+    repaired = []
+    for export in store.all_published_exports(conn):
+        if _owns_verified_file(export):
+            continue
+        export_id = export["export_id"]
+        data, digest = _expected(export)
+        own_path = artifacts.published_path(export_id)
+        via = artifacts.materialize_own(export_id, data, digest)
+        if store.repoint_published_artifact(conn, export_id, digest, own_path, actor,
+                                            "legacy_alias_repair via=%s" % via):
+            repaired.append(export_id)
+    return repaired
 
 
 def _converge(conn, export_id, digest, actor, via):

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS faults (
 DEFAULT_RULES = {"rules": [{"field": "vessel_id", "action": "hash", "length": 12}]}
 
 FAULT_MODES = ("crash_partial_write", "crash_after_staged")
+LEGACY_ALIAS_MODE = "legacy_alias"  # test-only: stored as "legacy_alias:<target_export_id>"
 
 
 def utcnow():
@@ -357,20 +358,54 @@ def published_artifacts(conn, export_id):
     return [dict(row) for row in rows]
 
 
-def published_for_decision(conn, decision_hash, exclude_export_id):
-    row = conn.execute(
-        """SELECT export_id, artifact_digest, artifact_path
-           FROM exports
-           WHERE decision_hash = ? AND export_id != ? AND stage = 'PUBLISHED'
-           ORDER BY published_at, export_id
-           LIMIT 1""",
-        (decision_hash, exclude_export_id),
-    ).fetchone()
-    return dict(row) if row else None
-
-
 def abort_artifact(conn, artifact_id):
     conn.execute("UPDATE artifacts SET kind = 'aborted' WHERE id = ? AND kind = 'staged'", (artifact_id,))
+
+
+def all_published_exports(conn, limit=1000):
+    rows = conn.execute(
+        "SELECT * FROM exports WHERE stage = 'PUBLISHED' ORDER BY published_at, export_id LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def repoint_published_artifact(conn, export_id, digest, path, actor, reason):
+    """Converge an already-PUBLISHED export onto its own verifiable artifact.
+
+    Terminal stage is untouched (never regressed); only the artifact pointer is
+    corrected, durably and auditably. The stale published artifact row is
+    aborted as evidence and a fresh one is recorded for the new file. Returns
+    True when this process performed the correction.
+    """
+    with immediate(conn):
+        existing = conn.execute(
+            "SELECT id, path, digest FROM artifacts WHERE export_id = ? AND kind = 'published'",
+            (export_id,),
+        ).fetchone()
+        if existing and existing["path"] == path and existing["digest"] == digest:
+            return False  # another process already converged this row
+        conn.execute(
+            "UPDATE artifacts SET kind = 'aborted' WHERE export_id = ? AND kind = 'published'",
+            (export_id,),
+        )
+        conn.execute(
+            "INSERT INTO artifacts(export_id, kind, path, digest, created_at) VALUES (?,?,?,?,?)",
+            (export_id, "published", path, digest, utcnow()),
+        )
+        conn.execute(
+            "UPDATE exports SET artifact_digest = ?, artifact_path = ?, updated_at = ? WHERE export_id = ?",
+            (digest, path, utcnow(), export_id),
+        )
+        journal(
+            conn, export_id, actor, "artifact_converged",
+            "%s old_path=%s old_digest=%s new_path=%s new_digest=%s"
+            % (reason,
+               existing["path"] if existing else None,
+               existing["digest"] if existing else None,
+               path, digest),
+        )
+    return True
 
 
 # ---------------------------------------------------------------- work queues
@@ -409,3 +444,28 @@ def pop_fault(conn, export_id, mode):
             conn.execute("DELETE FROM faults WHERE export_id = ?", (export_id,))
             return True
     return False
+
+
+def set_legacy_alias_fault(conn, export_id, target_export_id, actor="api"):
+    """Test-only: arm the old cross-decision reuse behavior for one processing.
+
+    Stored distinctly from crash modes so it survives the mode validation.
+    """
+    with immediate(conn):
+        conn.execute(
+            "INSERT INTO faults(export_id, mode) VALUES (?,?) ON CONFLICT(export_id) DO UPDATE SET mode = excluded.mode",
+            (export_id, LEGACY_ALIAS_MODE + ":" + target_export_id),
+        )
+        journal(conn, export_id, actor, "fault_armed",
+                "legacy_alias target=%s" % target_export_id)
+
+
+def pop_legacy_alias_target(conn, export_id):
+    """One-shot: return the target export id the worker should alias, or None."""
+    prefix = LEGACY_ALIAS_MODE + ":"
+    with immediate(conn):
+        row = conn.execute("SELECT mode FROM faults WHERE export_id = ?", (export_id,)).fetchone()
+        if row and row["mode"].startswith(prefix):
+            conn.execute("DELETE FROM faults WHERE export_id = ?", (export_id,))
+            return row["mode"][len(prefix):]
+    return None

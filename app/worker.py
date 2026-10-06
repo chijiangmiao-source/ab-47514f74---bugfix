@@ -38,17 +38,29 @@ def process_export(conn, export_id, me, fencing):
         store.journal(conn, export_id, me, "processing_started", None)
 
     export = store.get_export(conn, export_id)
-    previous = store.published_for_decision(conn, export["decision_hash"], export_id)
-    if previous:
-        with store.immediate(conn):
-            store.record_artifact(
-                conn, export_id, "published", previous["artifact_path"], previous["artifact_digest"]
-            )
-            store.mark_published(
-                conn, export_id, previous["artifact_digest"], previous["artifact_path"], me,
-                "matching_decision_reuse",
-            )
-        return "published"
+
+    # Test-only fault injection: reproduce the pre-fix cross-decision reuse
+    # bug exactly (publish this export onto the target's artifact). Used by
+    # acceptance to verify safe convergence of already-affected PUBLISHED rows.
+    alias_target = store.pop_legacy_alias_target(conn, export_id)
+    if alias_target is not None:
+        target = store.get_export(conn, alias_target)
+        if target and target["stage"] == "PUBLISHED":
+            with store.immediate(conn):
+                store.record_artifact(
+                    conn, export_id, "published",
+                    target["artifact_path"], target["artifact_digest"],
+                )
+                store.mark_published(
+                    conn, export_id, target["artifact_digest"], target["artifact_path"], me,
+                    "fault_legacy_alias",
+                )
+            return "published"
+
+    # Each export id renders its OWN artifact from its own frozen record
+    # (records + rules snapshot + first receipt/freeze time). A business-
+    # equivalent submission under a *different* export id is a separate
+    # decision and must get a separate, independently verifiable artifact.
     data = render_artifact_bytes(export)
     digest = hashlib.sha256(data).hexdigest()
     tmp = artifacts.tmp_path(export_id, uuid.uuid4().hex[:8])
@@ -126,6 +138,10 @@ def run_forever(me=None):
     config.ensure_dirs()
     conn = store.connect()
     store.init_db(conn)
+    repaired = recovery.converge_legacy_aliases(conn, me)
+    if repaired:
+        print("[%s] converged %d legacy aliased export(s): %s"
+              % (me, len(repaired), ",".join(repaired)), flush=True)
     recovery.sweep_orphans(conn, me)
     print("[%s] worker started (poll=%.2fs lease_ttl=%.1fs)" % (me, config.poll_interval(), config.lease_ttl()), flush=True)
     while True:

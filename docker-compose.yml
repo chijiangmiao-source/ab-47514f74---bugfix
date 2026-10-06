@@ -44,6 +44,8 @@ services:
     environment:
       API_BASE: "http://app:8080"
       DATA_DIR: /data
+      VERIFY_PHASE: "${VERIFY_PHASE:-pre}"   # pre | post (run around a service restart)
+      VERIFY_RUN: "${VERIFY_RUN:-}"          # shared stable id linking the two phases
     volumes:
       - data:/data:ro
     restart: "no"              # one-shot: runs the acceptance suite and exits

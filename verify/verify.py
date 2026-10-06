@@ -7,8 +7,13 @@ the live HTTP API through the required scenarios:
   2. crash recovery (converge a complete staged artifact; clean up a partial one)
   3. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
+  4. two DIFFERENT export ids with equivalent content: each gets its own
+     published file/digest/freeze info (pre-restart phase); after the app and
+     workers are restarted, every result is re-checked (post-restart phase),
+     including safe convergence of an already-affected aliased PUBLISHED row.
 
-Exits 0 when everything passes, 1 otherwise.
+Phases are selected with VERIFY_PHASE=pre|post and share VERIFY_RUN so the two
+invocations reference the same stable export ids. Exits 0 on success.
 """
 import hashlib
 import json
@@ -23,7 +28,8 @@ import uuid
 API = os.environ.get("API_BASE", "http://localhost:8080").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUN = uuid.uuid4().hex[:6]
+RUN = os.environ.get("VERIFY_RUN") or uuid.uuid4().hex[:6]
+PHASE = os.environ.get("VERIFY_PHASE", "pre")
 
 FAILURES = []
 
@@ -93,6 +99,58 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def eid(index):
+    return "VFY%d-%s" % (index, RUN)
+
+
+def get_detail(export_id):
+    status, raw, _ = req("GET", "/api/exports/" + export_id)
+    return as_json(raw) if status == 200 else None
+
+
+def check_own_download(export_id, detail, label):
+    """Download and assert the bytes are this export's OWN frozen artifact:
+    file hash == recorded artifact digest, and the embedded export id / freeze
+    time / input+rules digests all match the export's frozen row."""
+    status, raw, _ = download(export_id)
+    ok = check("%s: download 200" % label, status == 200, "HTTP %s %s" % (status, raw[:200]))
+    if status != 200:
+        return None
+    check("%s: file hash equals recorded artifact digest" % label,
+          hashlib.sha256(raw).hexdigest() == detail["artifact_digest"])
+    doc = as_json(raw)
+    check("%s: download carries its OWN export id and freeze time" % label,
+          doc.get("export_id") == export_id
+          and doc.get("received_at") == detail["received_at"],
+          "embedded=%s/%s row=%s/%s" % (
+              doc.get("export_id"), doc.get("received_at"), export_id, detail["received_at"]))
+    check("%s: download matches its own frozen input/rules summary" % label,
+          doc.get("input_digest") == detail["input_digest"]
+          and doc.get("rules_digest") == detail["rules_digest"])
+    return doc
+
+
+def wait_own_download(export_id, timeout, label):
+    """Wait for PUBLISHED then for a download that verifies as its own artifact
+    (covers a legacy alias converging just before/after a restart)."""
+    deadline = time.time() + timeout
+    detail = wait_for_stage(export_id, "PUBLISHED", timeout)
+    status = None
+    while time.time() < deadline:
+        detail = get_detail(export_id) or detail
+        status, raw, _ = download(export_id)
+        if status == 200:
+            doc = as_json(raw)
+            if (doc.get("export_id") == export_id
+                    and doc.get("received_at") == (detail or {}).get("received_at")
+                    and hashlib.sha256(raw).hexdigest() == detail["artifact_digest"]):
+                return detail, doc
+        time.sleep(0.5)
+    check("%s: eventually serves its own verified artifact" % label, False,
+          "last HTTP %s detail=%s" % (status, detail and detail.get("stage")))
+    return detail, None
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -135,8 +193,9 @@ def wait_for_api():
     raise SystemExit(1)
 
 
-def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+def phase_pre():
+    e1, e2, e3, e4, e5 = (eid(i) for i in range(1, 6))
+    e6, e7, e8, e9 = (eid(i) for i in range(6, 10))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -146,6 +205,10 @@ def smoke():
         {"field": "vessel_id", "action": "hash", "length": 10},
     ]}
     rules_r2 = {"rules": [{"field": "lat", "action": "redact"}]}
+    rules_r3 = {"rules": [
+        {"field": "depth_m", "action": "redact"},
+        {"field": "vessel_id", "action": "hash", "length": 10},
+    ]}
 
     step("页面通过真实 API 轮询（页面可加载且引用 API）")
     status, raw, headers = req("GET", "/")
@@ -198,7 +261,7 @@ def smoke():
     d2 = as_json(raw)["digest"]
     check("R2 digest differs", d2 != d1)
 
-    step("规则改动后重传 E1（同记录）→ 409 冲突（规则快照不同）")
+    step("规则变动后重传 E1（同记录）→ 409 冲突（规则快照不同）")
     status, raw, _ = req("POST", "/api/exports", {"export_id": e1, "records": recs})
     conflict = as_json(raw)
     check("replay under changed rules -> 409", status == 409, "HTTP %s" % status)
@@ -306,24 +369,194 @@ def smoke():
           detail2b is not None and detail2b["artifact_digest"] == detail2["artifact_digest"])
     check("exactly one published artifact file for E2", len(published_files(e2)) == 1)
 
+    # ------------------------------------------------- two distinct export ids
+    step("设置规则 R3，提交两份不同标识、业务等价的导出（E6 先发布，再提交 E7）")
+    status, raw, _ = req("PUT", "/api/rules", rules_r3)
+    check("put rules R3", status == 200, "HTTP %s" % status)
+    d3 = as_json(raw)["digest"]
+
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201, "HTTP %s %s" % (status, raw[:200]))
+    receipt6 = as_json(raw)
+    check("E6 froze rules R3", receipt6.get("rules_digest") == d3)
+    detail6 = wait_for_stage(e6, "PUBLISHED", 90)
+    check("E6 published", detail6 is not None and detail6["stage"] == "PUBLISHED")
+    check_own_download(e6, detail6, "E6")
+
+    # keep the masking rules unchanged; business-equivalent payload only
+    reordered_r3 = [dict(reversed(list(r.items()))) for r in recs]
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e7, "records": reordered_r3})
+    check("submit E7 -> 201 (independent id, not a replay)", status == 201,
+          "HTTP %s %s" % (status, raw[:200]))
+    receipt7 = as_json(raw)
+    check("E7 froze the same R3 snapshot", receipt7.get("rules_digest") == d3)
+    check("E7 got its own first receipt/freeze",
+          receipt7.get("receipt_id") != receipt6.get("receipt_id")
+          and receipt7.get("received_at") != receipt6.get("received_at"))
+    detail7 = wait_for_stage(e7, "PUBLISHED", 90)
+    check("E7 published", detail7 is not None and detail7["stage"] == "PUBLISHED")
+    doc7 = check_own_download(e7, detail7, "E7")
+
+    step("两份导出工件彼此独立（文件、摘要、下载内容均属于自身冻结信息）")
+    check("E6/E7 detail artifact summaries differ",
+          detail6["artifact_digest"] != detail7["artifact_digest"],
+          "%s vs %s" % (detail6["artifact_digest"], detail7["artifact_digest"]))
+    check("separate published files for E6 and E7",
+          len(published_files(e6)) == 1 and len(published_files(e7)) == 1,
+          "%s %s" % (published_files(e6), published_files(e7)))
+    p6 = os.path.join(DATA_DIR, "artifacts", "published", e6 + ".json")
+    p7 = os.path.join(DATA_DIR, "artifacts", "published", e7 + ".json")
+    with open(p6, "rb") as fh6, open(p7, "rb") as fh7:
+        b6, b7 = fh6.read(), fh7.read()
+    check("published file bytes differ and embed own id",
+          hashlib.sha256(b6).hexdigest() == detail6["artifact_digest"]
+          and hashlib.sha256(b7).hexdigest() == detail7["artifact_digest"]
+          and as_json(b6)["export_id"] == e6 and as_json(b7)["export_id"] == e7)
+    check("E7 masked content is business-equivalent to E6",
+          doc7 is not None and doc7["records"][0]["depth_m"] == "***"
+          and doc7["records"][0]["lat"] == 31.230416)
+
+    # --------------------------------------- already-affected (legacy aliases)
+    step("受影响导出 E8（旧版别名）：下载接口不得暴露 E6 内容，并安全收敛为自身工件")
+    status, _, _ = req("POST", "/api/test/fault",
+                       {"export_id": e8, "mode": "legacy_alias", "target_export_id": e6})
+    check("arm fault legacy_alias E8->E6", status == 202, "HTTP %s" % status)
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e8, "records": recs})
+    check("submit E8 -> 201", status == 201)
+    detail8 = wait_for_stage(e8, "PUBLISHED", 90)
+    check("E8 shows PUBLISHED (affected aliased state)",
+          detail8 is not None and detail8["stage"] == "PUBLISHED")
+    check("E8 was recorded against E6's artifact summary (the bug)",
+          detail8 is not None and detail8["artifact_digest"] == detail6["artifact_digest"])
+    # The download must never return E6's bytes; the server converges E8 to its
+    # own artifact and serves that instead.
+    _, doc8 = wait_own_download(e8, 60, "E8")
+    check("E8 download never exposes E6 identity",
+          doc8 is not None and doc8.get("export_id") == e8
+          and doc8.get("received_at") != detail6["received_at"])
+    detail8b = get_detail(e8)
+    check("E8 converged summary now differs from E6 and has its own file",
+          detail8b["artifact_digest"] != detail6["artifact_digest"]
+          and len(published_files(e8)) == 1)
+    events8 = [e["event"] for e in (detail8b or {}).get("events", [])]
+    check("E8 convergence recorded as evidence", "artifact_converged" in events8, str(events8))
+
+    step("受影响导出 E9：重启前保持别名已发布状态（不触发下载），留待重启收敛")
+    status, _, _ = req("POST", "/api/test/fault",
+                       {"export_id": e9, "mode": "legacy_alias", "target_export_id": e6})
+    check("arm fault legacy_alias E9->E6", status == 202, "HTTP %s" % status)
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e9, "records": recs})
+    check("submit E9 -> 201", status == 201)
+    detail9 = wait_for_stage(e9, "PUBLISHED", 90)
+    check("E9 shows PUBLISHED while aliased to E6",
+          detail9 is not None and detail9["stage"] == "PUBLISHED"
+          and detail9["artifact_digest"] == detail6["artifact_digest"],
+          "digest=%s" % (detail9 and detail9.get("artifact_digest")))
+    check("E9 has no own published file before restart", not os.path.exists(
+        os.path.join(DATA_DIR, "artifacts", "published", e9 + ".json")))
+
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
-        leftovers.extend(tmp_files(eid))
+    for i in range(1, 10):
+        leftovers.extend(tmp_files(eid(i)))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 
 
+def phase_post():
+    """After app + workers restart: every result must still be independently
+    correct, including E9 (left aliased pre-restart) converged at startup."""
+    ids = [eid(i) for i in range(1, 10)]
+    step("重启后：全部导出仍为 PUBLISHED，且各自下载自身冻结工件")
+    status, raw, _ = req("GET", "/api/exports")
+    check("list exports after restart", status == 200, "HTTP %s" % status)
+    rows = {x["export_id"]: x for x in as_json(raw)["exports"]} if status == 200 else {}
+    for export_id in ids:
+        check("%s present and PUBLISHED after restart" % export_id,
+              rows.get(export_id, {}).get("stage") == "PUBLISHED",
+              "row=%s" % rows.get(export_id))
+
+    details = {}
+    for export_id in ids:
+        detail = wait_for_stage(export_id, "PUBLISHED", 30)
+        details[export_id] = detail
+        check_own_download(export_id, detail, "%s post-restart" % export_id)
+        check("%s exactly one own published file after restart" % export_id,
+              len(published_files(export_id)) == 1, str(published_files(export_id)))
+
+    step("重启后：E6/E7 工件依旧相互独立")
+    d6, d7 = details[eid(6)], details[eid(7)]
+    check("E6/E7 summaries remain distinct",
+          d6["artifact_digest"] != d7["artifact_digest"]
+          and d6["receipt_id"] != d7["receipt_id"]
+          and d6["received_at"] != d7["received_at"])
+
+    step("重启后：E9 已在启动阶段安全收敛为自身可校验工件（无阶段倒退）")
+    d9 = details[eid(9)]
+    d6 = details[eid(6)]
+    check("E9 converged away from E6 summary",
+          d9["artifact_digest"] != d6["artifact_digest"])
+    check("E9 terminal stage preserved", d9["stage"] == "PUBLISHED" and d9["published_at"] is not None)
+    p9 = os.path.join(DATA_DIR, "artifacts", "published", eid(9) + ".json")
+    check("E9 own published file exists and verifies", os.path.exists(p9))
+    if os.path.exists(p9):
+        with open(p9, "rb") as fh:
+            check("E9 file hash equals its summary",
+                  hashlib.sha256(fh.read()).hexdigest() == d9["artifact_digest"])
+    full9 = get_detail(eid(9))
+    events9 = full9.get("events", [])
+    check("E9 journal records the convergence (startup/download)",
+          any(e.get("event") == "artifact_converged" for e in events9),
+          "events=%s" % [e["event"] for e in events9])
+
+    step("重启后：E8 收敛结果稳定；E6 原始工件从未被改动")
+    d8 = details[eid(8)]
+    check("E8 stays on its own converged artifact",
+          d8["artifact_digest"] != d6["artifact_digest"])
+    check_own_download(eid(8), d8, "E8 stable")
+    p6 = os.path.join(DATA_DIR, "artifacts", "published", eid(6) + ".json")
+    if os.path.exists(p6):
+        with open(p6, "rb") as fh:
+            b6 = fh.read()
+        check("E6 original file untouched (hash + own identity preserved)",
+              hashlib.sha256(b6).hexdigest() == d6["artifact_digest"]
+              and as_json(b6)["export_id"] == eid(6))
+    else:
+        check("E6 original file untouched (file present)", False)
+
+    step("重启后回归：规则冻结差异（E1 用 R1、E2 用 R2）与恢复证据仍成立")
+    _, b1, _ = download(eid(1))
+    _, b2, _ = download(eid(2))
+    c1, c2 = as_json(b1), as_json(b2)
+    check("E1 still redacts depth/keeps lat; E2 redacts lat after restart",
+          c1["records"][0]["depth_m"] == "***" and c1["records"][0]["lat"] == 31.230416
+          and c2["records"][0]["lat"] == "***")
+    check("E1/E2 frozen rules snapshots differ",
+          c1["rules_digest"] != c2["rules_digest"])
+    full3 = get_detail(eid(3)) or {}
+    check("E3 recovery evidence retained",
+          any("recovery" in (e.get("detail") or "") or "recover" in e.get("event", "")
+              for e in full3.get("events", [])))
+    check("E4 retry counter retained", details[eid(4)]["attempts"] >= 1)
+
+
 def main():
-    print("verify: one-shot acceptance run %s against %s" % (RUN, API), flush=True)
-    build_checks()
-    unit_tests()
+    print("verify: one-shot acceptance run %s phase=%s against %s" % (RUN, PHASE, API), flush=True)
+    if PHASE == "pre":
+        build_checks()
+        unit_tests()
+    elif PHASE != "post":
+        print("unknown VERIFY_PHASE=%r (expected pre|post)" % PHASE, flush=True)
+        return 2
     wait_for_api()
-    smoke()
+    if PHASE == "pre":
+        phase_pre()
+    else:
+        phase_post()
     print("\n==============================================")
     if FAILURES:
-        print("verify: FAILED (%d): %s" % (len(FAILURES), ", ".join(FAILURES)), flush=True)
+        print("verify[%s]: FAILED (%d): %s" % (PHASE, len(FAILURES), ", ".join(FAILURES)), flush=True)
         return 1
-    print("verify: ALL CHECKS PASSED", flush=True)
+    print("verify[%s]: ALL CHECKS PASSED" % PHASE, flush=True)
     return 0
 
 
